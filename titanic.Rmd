@@ -50,11 +50,32 @@ output:
 
 
 ## Load and check data
-```{r, message = FALSE}
+```{r Load_Data, message = FALSE}
 # Load packages
 if (!require("pacman")) install.packages("pacman")
+## Package overview
+# dplyr: data manipulation
+# purrr: functional programming
+# readr: read data
+# stringr: string manipulation
+# ggplot2: visualizations
+# tibble: alternative data frames
+# forcats: factor manipulation
+# mice: chained missing value imputation
+# tidyr: data reshaping/tidying
+# caret: machine learning wrapper
+# DMwR: SMOTE subsampling during resampling
+# kernlab: Support Vector Machines
+# pamr: Nearest Shrunken Centroids
+# nnet: Neural Networks
+# xgboost: Extreme Gradient Boosting
+
+# Install a 'dplyr' version that is more recent than 0.50 because the function
+# case_when() did not comply with mutate() in this and earlier versions.
+pacman::p_load_current_gh("tidyverse/dplyr")
 pacman::p_load(
-  "tidyverse", "caret", "vtreat", "forcats", "stringr"
+  "purrr", "readr", "stringr", "ggplot2", "tibble", "forcats", "mice", "tidyr", 
+  "caret", "DMwR", "kernlab", "pamr", "nnet", "xgboost"
 )
 
 # Training data
@@ -371,9 +392,9 @@ full %>%
 Interesting; the majority of passengers from the first class has been assigned
 to cabins with a valid numbers, whereas most passengers from the second and the
 third class do not have a record of their cabin.
+
 Let's further summarize by only looking at the distribution of existing
 cabins among passenger classes.
-
 ```{r}
 full %>% 
   filter(!is.na(Cabin)) %>% 
@@ -386,6 +407,53 @@ first class passengers.
 At this point, my hypothesis would be that these classes comprised the three 
 uppermost levels of the Titanic, which should boost the passengers of survival.
 So we should definitely model this variable!
+We should also have a look at the number of passengers in any cabin category
+and ensure that any category does not comprise a very low number of passengers,
+which would be useful for our predictions.
+
+```{r}
+full %>% 
+  select(CabinD, Title) %>% 
+  table() %>% 
+  addmargins()
+```
+
+Clearly, categories "G" and "T", with 5 and 1 passenger, respectively, contain
+far too little information to be useful later on.
+Based on the previous plot and frequency table, we could see that the majority
+of identified cabins were taken by first class passengers.
+This can be further corroborated by looking at the following frequency table
+for the variables `CabinD` and `Pclass`:
+
+```{r}
+full %>% 
+  select(CabinD, Pclass) %>% 
+  table() %>% 
+  addmargins()
+```
+
+Obviously, `CabinD` is only useful for assisting the prediction of survival for
+passengers of the first class.
+Therefore, I will assign all passengers from the second and the third class, as 
+well as the single member of cabin category "T" to a new cabin class "unknown".
+
+```{r}
+full <- full %>% 
+  mutate(CabinD = case_when(
+    CabinD == "T" ~ "unknown",
+    Pclass %in% c(2, 3) ~ "unknown",
+    is.na(CabinD) ~ "unknown",
+    Pclass == 1 ~ CabinD
+  ))
+
+# Check out the new levels.
+full %>% 
+  select(CabinD, Pclass) %>% 
+  table(useNA = "ifany") %>% 
+  addmargins()
+```
+
+
 We could further have a look at the range of ticket prices for each cabin 
 category:
 
@@ -516,76 +584,288 @@ This looks a bit better and will (hopefully) suffice for modeling.
 
 
 # Develop a treatment plan
-We still have two variables with a large fraction of missing values, namley 
-`Age` and `CabinD`.
-Now, we'll generate a treatment plan that helps with 
-
--   re-encoding missing values
-
--   dealing with large cardinality categorical variables
-
--   dealing with novel levels in the test set that were not present during training
-
--   fixing variable/column names to be "R safe"
-
--   looking for strange column types
-
-[Source](http://www.win-vector.com/blog/2016/06/a-demonstration-of-vtreat-data-preparation/)
-
+For our predictions, we need to ensure that our predictors do not contain 
+missing values.
+Hence, we need to impute them in a meaningful way.
 
 ```{r}
-# Define the problem
-y_name <- "Survived"
-y_target <- "1"
-# Keep only a subset of variables that are potentially useful for predicting
-# survival after the exploratory data analysis.
+# Compute the average level of missing data for each predictor.
+compute_na_fraction <- compose(mean, is.na)
+full %>% 
+  select(one_of(c(
+    "Pclass", "BoxCoxFare", "Title", "Age", "FamSizeD", "CabinD", "Ticket"
+  ))) %>% 
+  summarize_all(.funs = funs(compute_na_fraction))
+```
+
+We have a very large number of missing values in the predictor `Age`, which 
+might be informative for survival because i) children might have had priority
+for lifeboat spots and ii) older people could be more frail/less agile.
+escaping their rooms and to search for a lifeboat.
+Hence, we should try to impute this variable, but also add a new variable, which
+indicates which values were imputed so that this information is also available
+to the prediction model.
+
+```{r}
+# Add a new variable `AgeIsBad`, which indicates whether, for a particular 
+# passenger, the `Age` variable is uninformative ("yes") or informative "no").
+full <- full %>% 
+  mutate(AgeIsBad = if_else(
+    is.na(Age),
+    true = "yes",
+    false = "no"
+  )) %>% 
+  mutate(AgeIsBad = AgeIsBad %>% as.factor())
+
 var_names <- c(
-  "Pclass", "BoxCoxFare", "Title", "Age", "Sex", "FamSizeD", "CabinD", "Ticket"
+  "Pclass", "BoxCoxFare", "Title", "Age", "Sex", "FamSizeD", "CabinD", 
+  "Ticket", "AgeIsBad"
 )
 
-# Build variable encoding plan and prepare simulated out of sample training 
-# cross-frame.
-cd <- mkCrossFrameCExperiment(
-  dframe = full %>% filter(Data_Set == "Training"),
-  varlist = var_names,
-  outcomename = y_name,
-  outcometarget = y_target
-)
-score_frame <- cd$treatments$scoreFrame
-train_treated <- cd$crossFrame
+# Impute the missing age values using Bayesian linear regression 
+# (method = "norm") and 100 rounds of multiple imputations.
+mice_age <- full %>% 
+  select(one_of(var_names)) %>% 
+  mice(., method = "norm", m = 100, print = FALSE) %>% 
+  mice::complete() %>% 
+  select(Age) %>% 
+  flatten_dbl()
 
-# Pick variables
-new_vars <- score_frame$varName[score_frame$sig < 1 / nrow(score_frame)]
-test_treated <- vtreat::prepare(
-  treatmentplan = cd$treatments,
-  dframe = full %>% filter(Data_Set == "Test"),
-  pruneSig = NULL,
-  varRestriction = new_vars
+# Convert these variables to factors.
+factor_vars <- c(
+  "Survived", "Pclass", "Ticket", "FamSizeD", "CabinD"
+)
+
+# Chained function for save conversion from any format to factors.
+convert_to_factor <- compose(as.factor, as.character)
+
+# Add the imputed ages to the data frame.
+full <- full %>% 
+  mutate(Imputed_Age = mice_age) %>% 
+  mutate_at(.vars = factor_vars, .funs = convert_to_factor)
+
+# Check whether the imputation of the `Age` variable produced sensible results.
+full %>%
+  select(Age, Imputed_Age, PassengerId) %>% 
+  gather(key = State, value = Age, -PassengerId) %>% 
+  mutate(State = State %>% as.factor()) %>% 
+  mutate(State = fct_recode(State,
+    Original = "Age",
+    Imputed = "Imputed_Age"
+    )) %>% 
+  ggplot(aes(x = Age)) +
+  geom_histogram() +
+  facet_wrap(~ State)
+```
+
+It looks as if the "mice" function did a good job on the imputation of missing 
+"Age" values when comparing the distribution of the "Imputed" values with the 
+distribution of the "Original" values.
+
+
+
+
+
+# Final fixes
+Prior to modeling the data, we need to convert any factors, that are encoded
+by digits, to strings.
+Moreover, scale and center the `Imputed_Age` variable.
+```{r}
+full <- full %>% 
+  mutate(
+    Survived = fct_recode(
+      Survived,
+      yes = "1",
+      no = "0"
+    ),
+    Pclass = fct_recode(
+      Pclass,
+      First = "1",
+      Second = "2",
+      Third = "3"
+    ),
+    Imputed_Age = scale(Imputed_Age, center = TRUE, scale = TRUE)
+  )
+```
+
+
+
+
+# Cross-validation
+Next in line is cross-validation on the training set to minimize differences in
+model performance between training and test sets.
+First, we'll recover the training set data:
+```{r}
+# Use only the following variables in the prediction models.
+pred_vars <- c(
+  "Survived", "Pclass", "Imputed_Age", "Ticket", "Title", "FamSizeD", "CabinD",
+  "BoxCoxFare", "AgeIsBad"
+)
+# Extract the training data after the previous feature engineering.
+eng_train <- full %>%
+  filter(Data_Set == "Training") %>% 
+  select(one_of(pred_vars))
+```
+
+
+## Logistic regression
+```{r Logistic_Regression, cache = TRUE}
+# Next, we'll create balanced splits of the data based on the outcome.
+train_control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  classProbs = TRUE,
+  sampling = "smote",
+  summaryFunction = twoClassSummary
+)
+
+set.seed(340934)
+log_res <- train(
+  Survived ~ .,
+  data = eng_train,
+  method = "glm",
+  metric = "ROC",
+  trControl = train_control,
+  trace = FALSE
 )
 ```
 
 
-# Prediction
-Now, we train our model and tune parameters using the `caret` package.
-```{r}
-y_form <- new_vars %>% 
-  paste(., collapse = " + ") %>% 
-  paste(y_name, ., sep = " ~ ") %>% 
-  as.formula()
-
-fit_control <- trainControl(
-  method = "cv",
-  number = 5,
-  classProbs = TRUE
+## Support Vector Machines
+```{r SVM, cache = TRUE}
+# Hyper parameter estimation for the Gaussian Radial Basis Kernel
+# Note that 'frac' denotes the fraction of data to be used for estimation.
+# Here, we set it to a value of '1' because were are working on the training
+set.seed(340934)
+sig_dist <- sigest(
+  Survived ~ .,
+  data = eng_train,
+  frac = 1
+)
+svm_tune_grid <- data.frame(
+  sigma = as.vector(sig_dist)[1],
+  C = 2^(-2:7)
 )
 
-model <- train(
-  form = y_form,
-  data = train_treated %>% 
-    mutate(Survived = Survived %>% as.character() %>% as.factor()),
-  method = "lda",
+set.seed(340934)
+svm_res <- train(
+  Survived ~ .,
+  data = eng_train,
+  method = "svmRadial",
+  tuneGrid = svm_tune_grid,
   metric = "ROC",
-  trControl = fit_control,
-  verbose = FALSE
+  trControl = train_control,
+  trace = FALSE
 )
+```
+
+
+## Nearest Shrunken Centroids
+```{r NSC, cache=TRUE}
+nsc_grid <- data.frame(.threshold = seq(from = 0, to = 25, by = 1))
+set.seed(340934)
+nsc_res <- train(
+  Survived ~ .,
+  data = eng_train,
+  method = "pam",
+  tuneGrid = nsc_grid,
+  metric = "ROC",
+  trControl = train_control,
+  trace = FALSE
+)
+```
+
+
+## Neural Networks
+```{r NN, cache = TRUE}
+nnet_grid <- expand.grid(
+  .size = seq_len(10),
+  .decay = c(0, 0.1, 1, 2)
+)
+max_size <- max(nnet_grid$.size)
+num_wts <- 1 * (max_size * (nrow(eng_train) + 1) + max_size + 1)
+set.seed(340934)
+nnet_res <- train(
+  Survived ~ .,
+  data = eng_train,
+  method = "nnet",
+  metric = "ROC",
+  tuneGrid = nnet_grid,
+  maxit = 2000,
+  MaxNWts = num_wts,
+  trControl = train_control,
+  trace = FALSE
+)
+```
+
+
+## K-Nearest Neighbors
+```{r KNN, cache = TRUE}
+knn_grid <- data.frame(
+  .k = c(4 * (0:5) + 1,
+         20 * (1:5) + 1,
+         50 * (2:9) + 1)
+)
+set.seed(340934)
+knn_res <- train(
+  Survived ~ .,
+  data = eng_train,
+  method = "knn",
+  metric = "ROC",
+  tuneGrid = knn_grid,
+  trControl = train_control
+)
+```
+
+
+## Extreme Gradient Boosting
+```{r XGBoost, cache = TRUE}
+# Set up the cross-validated hyper-parameter search
+# grid parameters taken from http://stats.stackexchange.com/a/263649
+xgb_grid <- expand.grid(
+  nrounds = 1e3,
+  eta = 0.05,
+  max_depth = c(2L, 10L),
+  gamma = c(0, 10),
+  colsample_bytree = c(0.1, 0.4),
+  min_child_weight = c(1L, 10L),
+  subsample = c(0.5, 1)
+)
+set.seed(340934)
+xgb_res <- train(
+  Survived ~ .,
+  data = eng_train,
+  method = "xgbTree",
+  metric = "ROC",
+  tuneGrid = xgb_grid,
+  trControl = train_control,
+  trace = FALSE
+)
+```
+
+
+# Model comparisons
+```{r Model_Comparison, cache = TRUE}
+resampled_res <- list(
+  Logistic = log_res,
+  SVM = svm_res,
+  NSC = nsc_res,
+  NeuralNet = nnet_res,
+  KNN = knn_res,
+  XGBoost = xgb_res
+) %>% 
+  resamples() %>% 
+  .[["values"]] %>% 
+  as_data_frame()
+
+resampled_res %>% 
+  select(., matches(c("ROC|Resample"))) %>% 
+  setNames(gsub(pattern = "~ROC", replacement = "", x = names(.))) %>% 
+  gather(key = Algorithm, value = ROC, -Resample) %>% 
+  mutate(
+    Algorithm = Algorithm %>% as.factor()
+  ) %>% 
+  ggplot(aes(x = fct_reorder(Algorithm, ROC, median), y = ROC)) +
+  geom_boxplot()
 ```
