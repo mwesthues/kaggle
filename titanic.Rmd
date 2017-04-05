@@ -1,0 +1,591 @@
+---
+title: "Titanic: Machine Learning from Disaster"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    number_sections: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: readable
+    highlight: tango
+---
+
+# Competition Description
+> The sinking of the RMS Titanic is one of the most infamous shipwrecks in 
+> history.
+> On April 15, 1912, during her maiden voyage, the Titanic sank after colliding 
+> with an iceberg, killing 1502 out of 2224 passengers and crew.
+> This sensational tragedy shocked the international community and led to better 
+> safety regulations for ships.
+
+> One of the reasons that the shipwreck led to such loss of life was that there 
+> were not enough lifeboats for the passengers and crew.
+> Although there was some element of luck involved in surviving the sinking,
+> some groups of people were more likely to survive than others, such as women,
+> children, and the upper-class.
+
+> In this challenge, we ask you to complete the analysis of what sorts of people 
+> were likely to survive. In particular, we ask you to apply the tools of machine 
+> learning to predict which passengers survived the tragedy.
+
+[Source](https://www.kaggle.com/c/titanic)
+
+
+## Data Dictionary
+| Variable | Description                                |
+| -------- | -----------                                |
+| survival | Survival  (0 = No, 1 = Yes)                |
+| pclass   | Ticket class (1 = 1st, 2 = 2nd, 3 = 3rd)   |
+| sex      | Sex                                        |
+| Age      | Age in years                               |
+| sibsp    | # of siblings / spouses aboard the titanic | 
+| parch    | # of parents / children aboard the titanic |
+| ticket   | Ticket number                              |
+| fare     | Passenger fare                             |
+| embarked | Port of Embarkation                        |
+
+
+
+
+
+## Load and check data
+```{r, message = FALSE}
+# Load packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  "tidyverse", "caret", "vtreat", "forcats", "stringr"
+)
+
+# Training data
+train_dat <- "./train.csv" %>% 
+  read_csv()
+# Test data
+test_dat <- "./test.csv" %>% 
+  read_csv()
+# For feature pre-processing, merge the training and the test data sets.
+full <- list(
+  Training = train_dat,
+  Test = test_dat
+  ) %>% 
+  bind_rows(.id = "Data_Set")
+```
+
+
+First, we'll have a look at the structure of the data.
+```{r}
+full %>% 
+  summary()
+```
+
+
+
+
+
+
+
+# Names and titles
+The 'Name' variable contains not only the names of passengers, but also their
+respective titles.
+This might provide useful information on top of knowing the passengers' gender
+and their ticket price.
+
+```{r}
+full %>% 
+  select(Name) %>% 
+  flatten_chr() %>% 
+  head(n = 10L)
+```
+
+Indeed, we can see that the variable 'Name' not only contains the first and
+last name of each passenger, but also titles.
+Let's extract these titles.
+Here, it seems as if the last name is separated from the title by a `,`, which
+is in turn succeded by a `.`.
+```{r}
+# Function for extracting the title from the 'Name' variable.
+extract_title <- function(x) {
+  passenger_pos <- regexpr(
+    "(?<=,\\s)[[:word:]]+(?=\\.)", text = x, perl = TRUE
+  )
+  titles <- substring(
+    x, 
+    first = passenger_pos,
+    last = passenger_pos + attr(passenger_pos, "match.length") - 1
+  )
+  titles
+}
+
+# Extract the title.
+full <- full %>% 
+  mutate(Title = extract_title(Name))
+
+# Look at the unique titles.
+full %>% 
+  select(Title) %>% 
+  unique() %>% 
+  flatten_chr()
+```
+
+At least one person doesn't have a title.
+Let's see what's going on there.
+
+```{r}
+full %>% 
+  filter(nchar(Title) == 0) %>% 
+  select(Name) %>% 
+  flatten_chr()
+```
+
+Ok, so this passenger actually has a title, which was not captured by the 
+regular expression.
+Let's just record her as "Countess" manually, here.
+
+```{r}
+full <- full %>% 
+  mutate(Title = if_else(
+    nchar(Title) == 0,
+    true = "Countess", 
+    false = Title
+  ))
+
+full %>% 
+  select(Title) %>% 
+  flatten_chr() %>% 
+  unique()
+```
+
+
+Let's see, if the titles also have some information on the age of the passengers.
+```{r}
+full %>% 
+  ggplot(aes(x = Title, y = Age)) +
+  geom_boxplot() +
+  facet_wrap(~ Sex, scales = "free") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+It looks like all male children were titled 'Master'. 
+
+```{r}
+full %>% 
+  filter(Title == "Master") %>% 
+  select(Age) %>% 
+  flatten_dbl() %>% 
+  summary()
+```
+
+I'll impute the age of the four NAs of passengers with the title 'Master' as 
+the arithmetic mean of this group.
+```{r}
+impute_age_as_average <- function(x) {
+  x %>% 
+   mutate(Age = if_else(
+     is.na(Age),
+     true = mean(Age, na.rm = TRUE),
+     false = Age
+   ))
+}
+
+full <- full %>% 
+  split(.$Title) %>% 
+  map_at("Master", .f = ~impute_age_as_average(.)) %>% 
+  bind_rows()
+```
+
+
+Some of the titles have the same meaning, such as "Miss" and "Ms", however, 
+titles such as "Lady" might hint at their social status.
+Here, we'll aggregate some titles.
+```{r}
+full <- full %>% 
+  mutate(Title = fct_collapse(Title,
+    Mrs = c("Mrs", "Mme"),
+    Miss = c("Miss", "Ms"),
+    Upperclass = c(
+      "Don", "Dona", "Rev", "Dr", "Major", "Lady", "Sir", "Mlle", "Col", 
+      "Capt", "Countess", "Jonkheer"
+      ),
+    Clerical = "Rev"
+  ))
+```
+
+
+Some of the passengers had the title "Rev", hence I've caterogized them as 'Clerical'.
+Were members of the clerus more likely to help other's and refrain from taking a spot in any of the life boats?
+```{r}
+full %>% 
+  filter(Title == "Clerical") %>% 
+  select(Survived) %>% 
+  flatten_int() %>% 
+  summary()
+```
+
+Indeed, none of the reverends survived.
+
+
+
+# Fare
+Is the fare different for children and for adults?
+```{r}
+categorize_age <- Vectorize(
+  function(x) {
+    if (x <= 6) {
+      "Young_Child"
+    } else if (6 < x && x <= 16) {
+      "Kid"
+    }
+  }
+)
+full %>% 
+  mutate(Age_Category = case_when(
+    .$Age <= 6 ~ "Young_Child",
+    .$Age <= 16 ~ "Kid",
+    .$Age > 16 ~ "Adult",
+    is.na(.$Age) ~ "Missing"
+  )) %>% 
+  ggplot(aes(x = Age_Category, y = Fare)) +
+  geom_boxplot() +
+  facet_wrap(~ Pclass)
+```
+
+Surprisingly, the ticket fares for children were not lower; actually they were
+rather higher than for adults.
+Hence, we should not use information on the ticket price for imputing the age
+of other passengers.
+
+
+
+# Families
+We would like to know whether single passengers have a higher chance of 
+surviving than families.
+```{r}
+# Assign passengers to either "Single" (i.e., travelling by themselves),
+# "Small" families or "Large" families.
+full <- full %>% 
+  mutate(
+    Surname = gsub(",.*$", replacement = "", x = Name),
+    Family_Size = SibSp + Parch + 1
+  ) %>% 
+  mutate(FamSizeD = case_when(
+    .$Family_Size > 4 ~ "Large",
+    .$Family_Size == 1 ~ "Single",
+    .$Family_Size <= 4 ~ "Small"
+  ))
+
+full %>% 
+  filter(Data_Set == "Training") %>% 
+  mutate(Survived = Survived %>% as.character()) %>% 
+  rename(`Discrete Family Size` = FamSizeD) %>% 
+  ggplot(aes(x = `Discrete Family Size`, fill = Survived)) +
+  geom_bar(position = "fill")
+```
+
+Members of large families had the lowest survival rate, followed by singles
+and members of small families, which had the highest chance of surviving the 
+disaster.
+
+
+
+
+# Embarkation
+Did the location of embarkation have an influence on the chance for survival?
+```{r}
+full %>% 
+  filter(Data_Set == "Training") %>% 
+  mutate(Survived = Survived %>% as.character()) %>% 
+  ggplot(aes(x = Embarked, fill = Survived)) +
+  geom_bar(position = "fill")
+```
+
+It looks as if passengers from Cherbourg had a higher chance of survival.
+But why should the point of their embarkation in itself have any influence on 
+survival?
+Perhaps, the fraction of 1st class passengers among people who embarked in
+Cherbourg is higher compared to passengers from the other two cities.
+
+```{r}
+full %>% 
+  mutate(Pclass = Pclass %>% as.character()) %>% 
+  ggplot(aes(x = Embarked, fill = Pclass)) +
+  geom_bar(position = "fill")
+```
+
+Indeed, the fraction of first class passengers is highest among people who 
+embarked the Titanic in Cherbourg.
+Our null hypothesis is that the location of embarkation and the passenger class
+are independent variables.
+We'll test this assumption with a $\chi^{2}$-test.
+
+```{r}
+full %>% 
+  select(Embarked, Pclass) %>% 
+  table() %>% 
+  chisq.test()
+```
+
+The $\chi^{2}$-test confirms what was indicated by the bar plot: The location
+of embarkation and the passenger class do not seem to be independent variables.
+We can probably omit the `Embarked` variable from the prediction models.
+
+
+
+# Cabins/Decks
+Further, we would like to know whether there is any pattern in the cabin IDs.
+After all, a lower-deck cabin was more likely to have people in a sinking ship
+trapped.
+
+```{r}
+# Get a glimpse of the general pattern of cabin names.
+full %>% 
+  select(Cabin) %>% 
+  flatten_chr() %>% 
+  discard(is.na(.)) %>% 
+  head(n = 10L)
+```
+
+So every cabin is initiated by a single letter, which might be indicative for
+the level of the cabin inside the ship.
+Let's extract this letter.
+```{r}
+extract_letter <- function(x) {
+  x %>% 
+    stringr::str_match(., pattern = "[A-Z]") %>% 
+    c()
+}
+
+full <- full %>% 
+  mutate(CabinD = if_else(
+    !is.na(Cabin),
+    true = extract_letter(Cabin),
+    false = Cabin
+  ))
+
+full %>% 
+  ggplot(aes(x = Pclass, fill = CabinD)) +
+  geom_bar(position = "stack")
+```
+
+Interesting; the majority of passengers from the first class has been assigned
+to cabins with a valid numbers, whereas most passengers from the second and the
+third class do not have a record of their cabin.
+Let's further summarize by only looking at the distribution of existing
+cabins among passenger classes.
+
+```{r}
+full %>% 
+  filter(!is.na(Cabin)) %>% 
+  ggplot(aes(x = Pclass, fill = CabinD)) +
+  geom_bar(position = "stack")
+```
+
+Cabins with the letters A to C seem to have belonged almost exclusively to
+first class passengers.
+At this point, my hypothesis would be that these classes comprised the three 
+uppermost levels of the Titanic, which should boost the passengers of survival.
+So we should definitely model this variable!
+We could further have a look at the range of ticket prices for each cabin 
+category:
+
+```{r}
+full %>% 
+  ggplot(aes(x = CabinD, y = Fare, fill = CabinD)) +
+  geom_boxplot()
+```
+
+The ticket prices for cabin category "A" somewhat defy my hypothesis.
+This might be a special case, though.
+However, the prices in categories "B" and "C", which are made up largely by 
+first class passengers, are in agreement with my hunch and we also see 
+that prices decrease from category "C" onwards.
+The ticket prices for unclassified cabins are also considerably lower than 
+most other categories.
+However, the fares for some unclassified cabins were fairly high, which 
+suggests that something simply went wrong when recording the passengers.
+
+
+## Tickets
+Now, let's have a look at the tickets, which might add information on the 
+cabin.
+
+```{r}
+full %>% 
+  select(Ticket) %>% 
+  flatten_chr() %>% 
+  head(n = 10L)
+```
+
+Some tickets are only comprised of digits whereas some tickets are a combination
+of digits and letters.
+Maybe this is informative of something more.
+
+```{r}
+not_na <- compose(`!`, is.na)
+full <- full %>% 
+  mutate(Ticket = if_else(
+    Ticket %>% extract_letter() %>% not_na(),
+    true = "Alphanumeric",
+    false = "Numeric"
+  ))
+```
+
+
+```{r}
+full %>% 
+  ggplot(aes(x = CabinD, fill = Ticket)) +
+  geom_bar(position = "fill")
+```
+
+```{r}
+full %>% 
+  ggplot(aes(x = Pclass, fill = Ticket)) +
+  geom_bar(position = "fill")
+```
+
+There does not seem to be an obvious association between what's printed on 
+the ticket and in which cabin category or passenger class a person traveled.
+Perhaps though, there is an underlying pattern so let's keep the recoded
+'Ticket' variable.
+
+
+
+
+
+
+
+
+
+# Fare adjustment
+```{r}
+# Look at Tukey's five nubmer summary of the ticket prices.
+full %>% 
+  select(Fare) %>% 
+  flatten_dbl() %>% 
+  fivenum()
+```
+
+This looks as if some people were free-riding the Titanic.
+Perhaps, some guests were invited to ride along with other passengers.
+The largest ticket price is `r train_dat %>% select(Fare) %>% flatten_dbl() %>% max()`.
+This looks plausible.
+The most expensive cabins, given that there were probably very few extremely
+luxurious suites.
+Next, let's check the distribution of ticket fares:
+
+```{r}
+full %>% 
+  ggplot(aes(x = Fare)) +
+  geom_histogram()
+```
+
+This looks like a power distribution, indicating that the majority of passengers 
+paid a (relatively) small amount of money for tickets, whereas a few passengers 
+paid a rather large sum.
+Apply a BoxCox transformation to the `Fare` variable to normalize the 
+distribution.
+
+```{r}
+transform_boxcox <- function(x) {
+  x %>% 
+    BoxCoxTrans() %>% 
+    predict(., x)
+}
+
+# Prior to the BoxCox-transformation, ensure that all values are striclty 
+# positive.
+full <- full %>% 
+  mutate(Pos_Fare = if_else(
+    Fare <= 0 | is.na(Fare),
+    true = 1,
+    false = Fare
+  )) %>% 
+  mutate(BoxCoxFare = transform_boxcox(Pos_Fare))
+
+full %>% 
+  ggplot(aes(x = BoxCoxFare)) +
+  geom_density() +
+  ylab("Density")
+```
+
+This looks a bit better and will (hopefully) suffice for modeling.
+
+
+
+
+
+# Develop a treatment plan
+We still have two variables with a large fraction of missing values, namley 
+`Age` and `CabinD`.
+Now, we'll generate a treatment plan that helps with 
+
+-   re-encoding missing values
+
+-   dealing with large cardinality categorical variables
+
+-   dealing with novel levels in the test set that were not present during training
+
+-   fixing variable/column names to be "R safe"
+
+-   looking for strange column types
+
+[Source](http://www.win-vector.com/blog/2016/06/a-demonstration-of-vtreat-data-preparation/)
+
+
+```{r}
+# Define the problem
+y_name <- "Survived"
+y_target <- "1"
+# Keep only a subset of variables that are potentially useful for predicting
+# survival after the exploratory data analysis.
+var_names <- c(
+  "Pclass", "BoxCoxFare", "Title", "Age", "Sex", "FamSizeD", "CabinD", "Ticket"
+)
+
+# Build variable encoding plan and prepare simulated out of sample training 
+# cross-frame.
+cd <- mkCrossFrameCExperiment(
+  dframe = full %>% filter(Data_Set == "Training"),
+  varlist = var_names,
+  outcomename = y_name,
+  outcometarget = y_target
+)
+score_frame <- cd$treatments$scoreFrame
+train_treated <- cd$crossFrame
+
+# Pick variables
+new_vars <- score_frame$varName[score_frame$sig < 1 / nrow(score_frame)]
+test_treated <- vtreat::prepare(
+  treatmentplan = cd$treatments,
+  dframe = full %>% filter(Data_Set == "Test"),
+  pruneSig = NULL,
+  varRestriction = new_vars
+)
+```
+
+
+# Prediction
+Now, we train our model and tune parameters using the `caret` package.
+```{r}
+y_form <- new_vars %>% 
+  paste(., collapse = " + ") %>% 
+  paste(y_name, ., sep = " ~ ") %>% 
+  as.formula()
+
+fit_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE
+)
+
+model <- train(
+  form = y_form,
+  data = train_treated %>% 
+    mutate(Survived = Survived %>% as.character() %>% as.factor()),
+  method = "lda",
+  metric = "ROC",
+  trControl = fit_control,
+  verbose = FALSE
+)
+```

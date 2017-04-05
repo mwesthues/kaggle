@@ -1,0 +1,50 @@
+# Do ignore these files anywhere
+*.csv
+*.gif
+*.pdf
+*.PDF
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.RDS
+*.rds
+*.rdata
+*.RData
+*.png
+*.jpeg
+*.jpg
+*.JPG
+*.PNG
+*.JPEG
+*.svg
+*.jar
+*.tar.gz
+*.Rhistory
+*.zip
+*.eps
+*~
+*.Rproj
+*.log
+*.aux
+*.bbl
+*.blg
+*.cls
+*.xwm
+*.synctex.gz
+*.out
+*.xcf
+
+
+# Ignore everything in these subdirectories
+# Do not ignore files of the following kind...
+!*.R
+!*.r
+!*.tex
+!*.md
+!*.sh
+!*.Rmd
+
+# Individual R files that shall not be tracked
+.Rproj.user
+
