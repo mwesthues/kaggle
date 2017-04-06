@@ -1,5 +1,6 @@
 ---
 title: "Titanic: Machine Learning from Disaster"
+author: Matthias Westhues
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
   html_notebook:
@@ -72,7 +73,7 @@ if (!require("pacman")) install.packages("pacman")
 
 # Install a 'dplyr' version that is more recent than 0.50 because the function
 # case_when() did not comply with mutate() in this and earlier versions.
-pacman::p_load_current_gh("tidyverse/dplyr")
+pacman::p_load_gh("tidyverse/dplyr")
 pacman::p_load(
   "purrr", "readr", "stringr", "ggplot2", "tibble", "forcats", "mice", "tidyr", 
   "caret", "DMwR", "kernlab", "pamr", "nnet", "xgboost"
@@ -118,8 +119,6 @@ full %>%
   head(n = 10L)
 ```
 
-Indeed, we can see that the variable 'Name' not only contains the first and
-last name of each passenger, but also titles.
 Let's extract these titles.
 Here, it seems as if the last name is separated from the title by a `,`, which
 is in turn succeded by a `.`.
@@ -198,7 +197,7 @@ full %>%
   summary()
 ```
 
-I'll impute the age of the four NAs of passengers with the title 'Master' as 
+I'll impute the age of the `r full %>% filter(Title == "Master") %>% select(Age) %>% flatten_dbl() %>% is.na() %>% sum()` NAs of passengers with the title 'Master' as 
 the arithmetic mean of this group.
 ```{r}
 impute_age_as_average <- function(x) {
@@ -355,8 +354,8 @@ We can probably omit the `Embarked` variable from the prediction models.
 
 # Cabins/Decks
 Further, we would like to know whether there is any pattern in the cabin IDs.
-After all, a lower-deck cabin was more likely to have people in a sinking ship
-trapped.
+After all, a lower-deck cabin should be more likely to have people in a sinking 
+ship trapped.
 
 ```{r}
 # Get a glimpse of the general pattern of cabin names.
@@ -390,7 +389,7 @@ full %>%
 ```
 
 Interesting; the majority of passengers from the first class has been assigned
-to cabins with a valid numbers, whereas most passengers from the second and the
+to cabins with valid numbers, whereas most passengers from the second and the
 third class do not have a record of their cabin.
 
 Let's further summarize by only looking at the distribution of existing
@@ -405,11 +404,12 @@ full %>%
 Cabins with the letters A to C seem to have belonged almost exclusively to
 first class passengers.
 At this point, my hypothesis would be that these classes comprised the three 
-uppermost levels of the Titanic, which should boost the passengers of survival.
+uppermost levels of the Titanic, which should boost the passengers' chance of 
+survival.
 So we should definitely model this variable!
 We should also have a look at the number of passengers in any cabin category
 and ensure that any category does not comprise a very low number of passengers,
-which would be useful for our predictions.
+which would be useless for our predictions.
 
 ```{r}
 full %>% 
@@ -684,7 +684,8 @@ full <- full %>%
       Second = "2",
       Third = "3"
     ),
-    Imputed_Age = scale(Imputed_Age, center = TRUE, scale = TRUE)
+    Imputed_Age = scale(Imputed_Age, center = TRUE, scale = TRUE),
+    Survived = Survived %>% factor(., levels = c("yes", "no"))
   )
 ```
 
@@ -771,8 +772,7 @@ nsc_res <- train(
   method = "pam",
   tuneGrid = nsc_grid,
   metric = "ROC",
-  trControl = train_control,
-  trace = FALSE
+  trControl = train_control
 )
 ```
 
@@ -859,13 +859,107 @@ resampled_res <- list(
   .[["values"]] %>% 
   as_data_frame()
 
+# Function for transforming untidy model output from caret's train() and
+# resamples() functions into the tidy long format.
+tidy_predictions <- function(x) {
+  # Extract model names
+  algos <- x %>% 
+    select(-matches("Resample")) %>% 
+    colnames() %>% 
+    str_extract(pattern = "[^~]+") %>% 
+    unique()
+  
+  # Function to transform results for a single algorithm from wide to long
+  # format.
+  tidy_single_model <- function(algo, x) {
+    algo_resample <- paste(algo, "Resample", sep = "|")
+    x %>% 
+      select(matches(algo_resample)) %>% 
+      setNames(gsub(
+        pattern = "[[:word:]]+~",
+        replacement = "",
+        perl = TRUE,
+        x = names(.)
+      )) %>% 
+      gather(key = Statistic, value = Value, -Resample) %>% 
+      mutate(Algorithm = algo)
+  }
+  
+  # Transform results from each algorithm from wide to long format and 
+  # aggregate all model outputs in a single data frame.
+  algos %>% 
+    as.list() %>% 
+    map(., .f = tidy_single_model, x = x) %>% 
+    bind_rows()
+}
+
+
 resampled_res %>% 
-  select(., matches(c("ROC|Resample"))) %>% 
-  setNames(gsub(pattern = "~ROC", replacement = "", x = names(.))) %>% 
-  gather(key = Algorithm, value = ROC, -Resample) %>% 
+  tidy_predictions() %>% 
   mutate(
     Algorithm = Algorithm %>% as.factor()
   ) %>% 
-  ggplot(aes(x = fct_reorder(Algorithm, ROC, median), y = ROC)) +
-  geom_boxplot()
+  ggplot(aes(
+    x = fct_reorder(f = Algorithm, x = Value, fun = median),
+    fill = Algorithm, y = Value
+  )) +
+  geom_boxplot() +
+  facet_wrap(~ Statistic, scales = "free_y") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank(),
+    legend.position = "top"
+  )
 ```
+
+We can see that extreme gradient boosting "XGBoost" is the clear winner in 
+terms of predicting the chance of survival.
+
+What is the importance of the variables that we provided to the extreme 
+gradient boosting algorithm?
+```{r}
+xgb_res %>% 
+  varImp(scale = TRUE) %>% 
+  .[["importance"]]
+```
+
+If your title was "Mr" you had a particular high chance **not** to survive the 
+sinking of the Titanic.
+The same is true for passengers without a known cabin.
+Females and passengers from the upper levels (cabins E, D and C) had a high chance
+of survival and most children made it.
+
+
+
+# Prediction
+Now, we will apply this algorithm to the test data.
+```{r}
+# Extract the test set after featuer engineering.
+eng_test <- full %>% 
+  filter(Data_Set == "Test") %>% 
+  select(one_of(c(pred_vars, "PassengerId")))
+
+# Predict using the test set.
+# Convert factors back to integer for compliance with the original data.
+#prediction <- 
+prediction <- predict(object = xgb_res, eng_test) %>% 
+  fct_recode(., "0" = "no", "1" = "yes") %>% 
+  as.character() %>% 
+  as.integer()
+
+# Save the solution to a data frame with two columns: PassengerId and Survived.
+solution <- data.frame(
+  PassengerId = eng_test %>% select(PassengerId) %>% flatten_int(),
+  Survived = prediction
+)
+
+# Write the solution to a file.
+write_csv(solution, path = "titanic_xgb_mod_solution.csv")
+```
+
+
+# Acknowledgments
+Many thanks to [Megan L. Risdal](https://www.kaggle.com/mrisdal) for inspiring 
+a couple of aspects in this analysis, particularly with respect to missing 
+value imputation using the `mice` package.
+You should definitely check out her very popular [kernel](https://www.kaggle.com/mrisdal/titanic/exploring-survival-on-the-titanic/notebook).
